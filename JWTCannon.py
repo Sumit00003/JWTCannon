@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -47,10 +48,22 @@ NONE_VARIANTS = [
     'None ', ' none', 'null', 'NULL', 'Null', '',
 ]
 
+# Directories that contain wordlists. Every file below these is used.
+SECLISTS_DIRS = [
+    "/usr/share/seclists/Passwords",
+    "/usr/share/wordlists",
+    "/opt/seclists/Passwords",
+    os.path.expanduser("~/seclists/Passwords"),
+    os.path.expanduser("~/wordlists"),
+    "./seclists/Passwords",
+]
+
+# Fallback single-file paths (used only if directory walk finds nothing).
 SECLISTS_PATHS = [
     '/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-1000000.txt',
     '/usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt',
-    '/usr/share/seclists/Passwords/Common-Credentials/rockyou.txt'
+    '/usr/share/seclists/Passwords/Common-Credentials/rockyou.txt',
+    '/usr/share/wordlists/rockyou.txt',
 ]
 
 HASHCAT_RULE_PATHS = [
@@ -275,7 +288,7 @@ def find_hashcat():
         if path:
             return path
     return None
-    
+
 def check_hashcat_backend(hashcat_path):
     """Return True if hashcat has a usable compute backend (OpenCL/CUDA/HIP)."""
     try:
@@ -357,58 +370,108 @@ def build_mask(charset_choice):
     custom_charset = "".join(parts)
     return custom_charset, "?1"
 
-def crack_with_hashcat_wordlist(jwt_info, hashcat_path, wordlist_path):
+def crack_with_hashcat_wordlist(jwt_info, hashcat_path, wordlist_files):
     print()
     print(c_sep())
-    print(c_title("TEST 5a: Hashcat Wordlist Attack"))
+    print(c_title("TEST 5a: Hashcat Wordlist Attack (multi-file)"))
     print(c_sep())
+
+    if isinstance(wordlist_files, str):
+        wordlist_files = [wordlist_files]
+
+    wordlist_files = [f for f in wordlist_files if os.path.isfile(f)]
+    if not wordlist_files:
+        print(c_fail("No usable wordlist files found."))
+        return None
+
+    total_bytes = sum(os.path.getsize(f) for f in wordlist_files)
+    print(c_info(f"Wordlists     : {len(wordlist_files)} file(s)"))
+    print(c_info(f"Total size    : {total_bytes / (1024*1024):.1f} MB"))
+    for f in wordlist_files[:10]:
+        print(f"    {Fore.CYAN}- {f}{Style.RESET_ALL}")
+    if len(wordlist_files) > 10:
+        print(f"    {Fore.CYAN}... and {len(wordlist_files) - 10} more{Style.RESET_ALL}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         hashfile = os.path.join(tmpdir, "jwt.hash")
         potfile  = os.path.join(tmpdir, "hashcat.potfile")
         write_hashfile(jwt_info, hashfile)
 
-        cmd = [
+        # ---- Build the base hashcat command ----
+        base_cmd = [
             hashcat_path,
             "-a", "0",
             "-m", "16500",
             hashfile,
-            wordlist_path,
-            "--potfile-path", potfile,
-            "--status",
-            "--status-timer", "5",
-            "--force",
-            "-O",
-            "-w", "3",
         ]
 
-        # Add best64.rule only if it exists
+        # ---- Rules ----
         rule_path = find_best64_rule()
         if rule_path:
-            cmd += ["-r", rule_path]
+            base_cmd += ["-r", rule_path]
             print(c_info(f"Using rules: {rule_path}"))
         else:
-            print(c_warn("best64.rule not found — running wordlist without rules."))
-            print(c_info("Install rules:  sudo apt install hashcat-data   (or hashcat)"))
-            print(c_info("Common paths searched:"))
-            for rp in HASHCAT_RULE_PATHS:
-                print(f"    - {rp}")
+            print(c_warn("best64.rule not found — running without rules."))
 
-        print(c_info(f"Hashcat command: {' '.join(cmd)}"))
-        print()
+        base_cmd += [
+            "--potfile-path", potfile,
+            "--status", "--status-timer", "5",
+            "--force", "-O", "-w", "3",
+        ]
 
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            if len(wordlist_files) == 1:
+                # ---- Fast path: single file, hashcat can mmap ----
+                cmd = base_cmd + [wordlist_files[0]]
+                print(c_info(f"Hashcat command: {shlex.join(cmd)}"))
+                print()
+                proc = subprocess.run(cmd, capture_output=True, text=True,
+                                      timeout=7200)
+                out = proc.stdout + proc.stderr
+                print(out)
+            else:
+                # ---- Multi-file path: stream all files via 'cat | hashcat -' ----
+                # Mimics:  cat file1 file2 ... | hashcat ... -
+                cmd = base_cmd + ["-"]
+                cat_cmd = ["cat"] + wordlist_files
+                print(c_info(f"Streaming: cat {len(wordlist_files)} files | hashcat ... -"))
+                print(c_info(f"Hashcat command: {shlex.join(cmd)}"))
+                print()
+
+                cat_proc = subprocess.Popen(
+                    cat_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        stdin=cat_proc.stdout,
+                        capture_output=True,
+                        text=True,
+                        timeout=7200,
+                    )
+                finally:
+                    try:
+                        cat_proc.stdout.close()
+                    except Exception:
+                        pass
+                    try:
+                        cat_proc.wait(timeout=10)
+                    except Exception:
+                        cat_proc.kill()
+
+                out = proc.stdout + proc.stderr
+                print(out[-4000:] if len(out) > 4000 else out)
+
         except subprocess.TimeoutExpired:
-            print(c_warn("Hashcat wordlist attack timed out (1 hour)."))
+            print(c_warn("Hashcat wordlist attack timed out (2h)."))
             return None
         except Exception as e:
             print(c_fail(f"Hashcat error: {e}"))
             return None
 
-        out = proc.stdout + proc.stderr
-        print(out)
-
+        # ---- Read potfile ----
         if os.path.isfile(potfile):
             with open(potfile) as f:
                 for line in f:
@@ -417,7 +480,7 @@ def crack_with_hashcat_wordlist(jwt_info, hashcat_path, wordlist_path):
                         print(c_ok(f"SECRET FOUND in wordlist: {secret!r}"))
                         return secret
 
-        print(c_fail("No match in wordlist."))
+        print(c_fail("No match in wordlists."))
         return None
 
 def crack_with_hashcat_mask(jwt_info, hashcat_path, charset_choice, min_len, max_len):
@@ -720,8 +783,42 @@ def prompt_crack_config():
 
 # ---------- SecLists discovery ----------
 
-def find_seclists():
-    return next((p for p in SECLISTS_PATHS if os.path.isfile(p)), None)
+def find_seclists_wordlists(explicit_dir=None, min_size=32, max_size=None):
+    """
+    Recursively collect every wordlist file under the SecLists / wordlists dirs.
+
+    Returns a sorted list of absolute paths.
+    - explicit_dir: if given, only walk this directory.
+    - min_size:     skip files smaller than this (bytes) — usually README stubs.
+    - max_size:     optional cap per file (bytes) to skip multi-GB monsters.
+    """
+    bases = [explicit_dir] if explicit_dir else SECLISTS_DIRS
+    found, seen = [], set()
+
+    for base in bases:
+        if not base or not os.path.isdir(base):
+            continue
+        for root, _, files in os.walk(base):
+            for name in files:
+                p = os.path.realpath(os.path.join(root, name))
+                if p in seen:
+                    continue
+                seen.add(p)
+                try:
+                    size = os.path.getsize(p)
+                except OSError:
+                    continue
+                if size < min_size:
+                    continue
+                if max_size and size > max_size:
+                    continue
+                found.append(p)
+
+    # Fallback: if nothing found in dirs, use the hard-coded list
+    if not found:
+        found = [p for p in SECLISTS_PATHS if os.path.isfile(p)]
+
+    return sorted(found)
 
 # ---------- Remaining attacks guide ----------
 
@@ -777,13 +874,18 @@ def main():
     p.add_argument("--ignore-expiry", action="store_true",
                    help="Skip the expiry prompt (continue regardless)")
     p.add_argument("--hashcat", default=None,
-                   help="Path to hashcat binary (auto-detect if omitted)")               
+                   help="Path to hashcat binary (auto-detect if omitted)")
     p.add_argument("--proxy", default=None,
                    help="Proxy URL for all requests, e.g. http://127.0.0.1:8080")
     p.add_argument("--burp", action="store_true",
                    help="Shortcut: route requests through Burp at 127.0.0.1:8080")
+    p.add_argument("--seclists-dir", default=None,
+                   help="Recursively use every wordlist under this directory "
+                        "(default: auto-discover SecLists/wordlists dirs)")
+    p.add_argument("--seclists-max-mb", type=int, default=0,
+                   help="Skip wordlist files larger than N MB (0 = no limit)")
     args = p.parse_args()
-    
+
         # ---- Proxy setup ----
     global PROXY_URL
     if args.burp:
@@ -860,16 +962,21 @@ def main():
     if not args.skip_crack and hashcat_path:
         found = None
 
-        # 5a: SecLists wordlist
-        wordlist = find_seclists()
-        if wordlist:
-            found = crack_with_hashcat_wordlist(jwt_info, hashcat_path, wordlist)
+        # 5a: every wordlist file under SecLists / wordlists dirs
+        wordlists = find_seclists_wordlists(
+            explicit_dir=args.seclists_dir,
+            max_size=(args.seclists_max_mb * 1024 * 1024) if args.seclists_max_mb else None,
+        )
+
+        if wordlists:
+            found = crack_with_hashcat_wordlist(jwt_info, hashcat_path, wordlists)
         else:
             print()
-            print(c_warn("SecLists wordlist NOT FOUND. Looked in:"))
-            for p in SECLISTS_PATHS:
-                print(f"    - {p}")
+            print(c_warn("No wordlists found. Searched in:"))
+            for d in SECLISTS_DIRS:
+                print(f"    - {d}")
             print(c_info("Install:  sudo apt install seclists"))
+            print(c_info("Or pass:  --seclists-dir /path/to/wordlists"))
             print(c_info("Skipping wordlist phase."))
 
         # 5b: Mask brute-force
@@ -882,10 +989,6 @@ def main():
         else:
             print()
             print(c_ok("Secret not recovered. Likely strong."))
-            
-        # 5b: Mask brute-force
-        #if not found:
-         #   found = crack_with_hashcat_mask(jwt_info, hashcat_path, choice, min_len, max_len)
 
     # Final guide
     print_remaining_attacks(jwt_info)
@@ -897,11 +1000,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        
-        
-        
-        
-        
         main()
     except KeyboardInterrupt:
         print()
